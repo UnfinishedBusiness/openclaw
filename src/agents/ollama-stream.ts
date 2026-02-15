@@ -9,19 +9,24 @@ import type {
 } from "@mariozechner/pi-ai";
 import { createAssistantMessageEventStream } from "@mariozechner/pi-ai";
 import { randomUUID } from "node:crypto";
+import { createSubsystemLogger } from "src/logging/subsystem.ts";
 
-export const OLLAMA_NATIVE_BASE_URL = "http://127.0.0.1:11434";
-
-// ── Ollama /api/chat request types ──────────────────────────────────────────
-
-interface OllamaChatRequest {
-  model: string;
-  messages: OllamaChatMessage[];
-  stream: boolean;
-  tools?: OllamaTool[];
-  options?: Record<string, unknown>;
+// Dynamic import for Ollama JS (cloud)
+let OllamaJs: typeof import("ollama").Ollama | undefined;
+try {
+  // @ts-ignore
+  OllamaJs = require("ollama").Ollama;
+} catch {
+  try {
+    // @ts-ignore
+    OllamaJs = (await import("ollama")).Ollama;
+  } catch {}
 }
 
+export const OLLAMA_NATIVE_BASE_URL = "http://127.0.0.1:11434";
+const log = createSubsystemLogger("src/agents/ollama-stream");
+
+// ── Types ────────────────────────────────────────────────────────────────
 interface OllamaChatMessage {
   role: "system" | "user" | "assistant" | "tool";
   content: string;
@@ -29,7 +34,6 @@ interface OllamaChatMessage {
   tool_calls?: OllamaToolCall[];
   tool_name?: string;
 }
-
 interface OllamaTool {
   type: "function";
   function: {
@@ -38,7 +42,6 @@ interface OllamaTool {
     parameters: Record<string, unknown>;
   };
 }
-
 interface OllamaToolCall {
   function: {
     name: string;
@@ -46,8 +49,14 @@ interface OllamaToolCall {
   };
 }
 
-// ── Ollama /api/chat response types ─────────────────────────────────────────
-
+// Request body for Ollama chat API (local)
+interface OllamaChatRequest {
+  model: string;
+  messages: OllamaChatMessage[];
+  stream: boolean;
+  tools?: OllamaTool[];
+  options?: Record<string, unknown>;
+}
 interface OllamaChatResponse {
   model: string;
   created_at: string;
@@ -66,14 +75,7 @@ interface OllamaChatResponse {
   eval_duration?: number;
 }
 
-// ── Message conversion ──────────────────────────────────────────────────────
-
-type InputContentPart =
-  | { type: "text"; text: string }
-  | { type: "image"; data: string }
-  | { type: "toolCall"; id: string; name: string; arguments: Record<string, unknown> }
-  | { type: "tool_use"; id: string; name: string; input: Record<string, unknown> };
-
+// ── Helpers ───────────────────────────────────────────────────────────────
 function extractTextContent(content: unknown): string {
   if (typeof content === "string") {
     return content;
@@ -81,28 +83,23 @@ function extractTextContent(content: unknown): string {
   if (!Array.isArray(content)) {
     return "";
   }
-  return (content as InputContentPart[])
-    .filter((part): part is { type: "text"; text: string } => part.type === "text")
+  return content
+    .filter((part) => part.type === "text")
     .map((part) => part.text)
     .join("");
 }
-
 function extractOllamaImages(content: unknown): string[] {
   if (!Array.isArray(content)) {
     return [];
   }
-  return (content as InputContentPart[])
-    .filter((part): part is { type: "image"; data: string } => part.type === "image")
-    .map((part) => part.data);
+  return content.filter((part) => part.type === "image").map((part) => part.data);
 }
-
 function extractToolCalls(content: unknown): OllamaToolCall[] {
   if (!Array.isArray(content)) {
     return [];
   }
-  const parts = content as InputContentPart[];
   const result: OllamaToolCall[] = [];
-  for (const part of parts) {
+  for (const part of content) {
     if (part.type === "toolCall") {
       result.push({ function: { name: part.name, arguments: part.arguments } });
     } else if (part.type === "tool_use") {
@@ -111,20 +108,16 @@ function extractToolCalls(content: unknown): OllamaToolCall[] {
   }
   return result;
 }
-
-export function convertToOllamaMessages(
+function convertToOllamaMessages(
   messages: Array<{ role: string; content: unknown }>,
   system?: string,
 ): OllamaChatMessage[] {
   const result: OllamaChatMessage[] = [];
-
   if (system) {
     result.push({ role: "system", content: system });
   }
-
   for (const msg of messages) {
     const { role } = msg;
-
     if (role === "user") {
       const text = extractTextContent(msg.content);
       const images = extractOllamaImages(msg.content);
@@ -142,13 +135,9 @@ export function convertToOllamaMessages(
         ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
       });
     } else if (role === "tool" || role === "toolResult") {
-      // SDK uses "toolResult" (camelCase) for tool result messages.
-      // Ollama API expects "tool" role with tool_name per the native spec.
       const text = extractTextContent(msg.content);
       const toolName =
-        typeof (msg as { toolName?: unknown }).toolName === "string"
-          ? (msg as { toolName?: string }).toolName
-          : undefined;
+        typeof (msg as any).toolName === "string" ? (msg as any).toolName : undefined;
       result.push({
         role: "tool",
         content: text,
@@ -156,12 +145,8 @@ export function convertToOllamaMessages(
       });
     }
   }
-
   return result;
 }
-
-// ── Tool extraction ─────────────────────────────────────────────────────────
-
 function extractOllamaTools(tools: Tool[] | undefined): OllamaTool[] {
   if (!tools || !Array.isArray(tools)) {
     return [];
@@ -182,19 +167,14 @@ function extractOllamaTools(tools: Tool[] | undefined): OllamaTool[] {
   }
   return result;
 }
-
-// ── Response conversion ─────────────────────────────────────────────────────
-
 export function buildAssistantMessage(
   response: OllamaChatResponse,
   modelInfo: { api: string; provider: string; id: string },
 ): AssistantMessage {
   const content: (TextContent | ToolCall)[] = [];
-
   if (response.message.content) {
     content.push({ type: "text", text: response.message.content });
   }
-
   const toolCalls = response.message.tool_calls;
   if (toolCalls && toolCalls.length > 0) {
     for (const tc of toolCalls) {
@@ -206,10 +186,8 @@ export function buildAssistantMessage(
       });
     }
   }
-
   const hasToolCalls = toolCalls && toolCalls.length > 0;
   const stopReason: StopReason = hasToolCalls ? "toolUse" : "stop";
-
   const usage: Usage = {
     input: response.prompt_eval_count ?? 0,
     output: response.eval_count ?? 0,
@@ -218,7 +196,6 @@ export function buildAssistantMessage(
     totalTokens: (response.prompt_eval_count ?? 0) + (response.eval_count ?? 0),
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
   };
-
   return {
     role: "assistant",
     content,
@@ -230,15 +207,11 @@ export function buildAssistantMessage(
     timestamp: Date.now(),
   };
 }
-
-// ── NDJSON streaming parser ─────────────────────────────────────────────────
-
 export async function* parseNdjsonStream(
   reader: ReadableStreamDefaultReader<Uint8Array>,
 ): AsyncGenerator<OllamaChatResponse> {
   const decoder = new TextDecoder();
   let buffer = "";
-
   while (true) {
     const { done, value } = await reader.read();
     if (done) {
@@ -247,7 +220,6 @@ export async function* parseNdjsonStream(
     buffer += decoder.decode(value, { stream: true });
     const lines = buffer.split("\n");
     buffer = lines.pop() ?? "";
-
     for (const line of lines) {
       const trimmed = line.trim();
       if (!trimmed) {
@@ -256,25 +228,16 @@ export async function* parseNdjsonStream(
       try {
         yield JSON.parse(trimmed) as OllamaChatResponse;
       } catch {
-        console.warn("[ollama-stream] Skipping malformed NDJSON line:", trimmed.slice(0, 120));
+        // skip malformed
       }
     }
   }
-
   if (buffer.trim()) {
     try {
       yield JSON.parse(buffer.trim()) as OllamaChatResponse;
-    } catch {
-      console.warn(
-        "[ollama-stream] Skipping malformed trailing data:",
-        buffer.trim().slice(0, 120),
-      );
-    }
+    } catch {}
   }
 }
-
-// ── Main StreamFn factory ───────────────────────────────────────────────────
-
 function resolveOllamaChatUrl(baseUrl: string): string {
   const trimmed = baseUrl.trim().replace(/\/+$/, "");
   const normalizedBase = trimmed.replace(/\/v1$/i, "");
@@ -282,23 +245,19 @@ function resolveOllamaChatUrl(baseUrl: string): string {
   return `${apiBase}/api/chat`;
 }
 
+// ── Main StreamFn factory ────────────────────────────────────────────────
 export function createOllamaStreamFn(baseUrl: string): StreamFn {
-  const chatUrl = resolveOllamaChatUrl(baseUrl);
-
   return (model, context, options) => {
+    const isLocal = /^https?:\/\/(127\.0\.0\.1|localhost)(:[0-9]+)?(\/|$)/.test(baseUrl);
+    const chatUrl = resolveOllamaChatUrl(baseUrl);
     const stream = createAssistantMessageEventStream();
-
     const run = async () => {
       try {
         const ollamaMessages = convertToOllamaMessages(
           context.messages ?? [],
           context.systemPrompt,
         );
-
         const ollamaTools = extractOllamaTools(context.tools);
-
-        // Ollama defaults to num_ctx=4096 which is too small for large
-        // system prompts + many tool definitions. Use model's contextWindow.
         const ollamaOptions: Record<string, unknown> = { num_ctx: model.contextWindow ?? 65536 };
         if (typeof options?.temperature === "number") {
           ollamaOptions.temperature = options.temperature;
@@ -306,84 +265,113 @@ export function createOllamaStreamFn(baseUrl: string): StreamFn {
         if (typeof options?.maxTokens === "number") {
           ollamaOptions.num_predict = options.maxTokens;
         }
-
-        const body: OllamaChatRequest = {
-          model: model.id,
-          messages: ollamaMessages,
-          stream: true,
-          ...(ollamaTools.length > 0 ? { tools: ollamaTools } : {}),
-          options: ollamaOptions,
-        };
-
-        const headers: Record<string, string> = {
-          "Content-Type": "application/json",
-          ...options?.headers,
-        };
-        if (options?.apiKey) {
-          headers.Authorization = `Bearer ${options.apiKey}`;
-        }
-
-        const response = await fetch(chatUrl, {
-          method: "POST",
-          headers,
-          body: JSON.stringify(body),
-          signal: options?.signal,
-        });
-
-        if (!response.ok) {
-          const errorText = await response.text().catch(() => "unknown error");
-          throw new Error(`Ollama API error ${response.status}: ${errorText}`);
-        }
-
-        if (!response.body) {
-          throw new Error("Ollama API returned empty response body");
-        }
-
-        const reader = response.body.getReader();
-        let accumulatedContent = "";
-        const accumulatedToolCalls: OllamaToolCall[] = [];
-        let finalResponse: OllamaChatResponse | undefined;
-
-        for await (const chunk of parseNdjsonStream(reader)) {
-          if (chunk.message?.content) {
-            accumulatedContent += chunk.message.content;
+        if (!isLocal && OllamaJs) {
+          // Use Ollama JS library for cloud
+          const client = new OllamaJs({ host: baseUrl });
+          let accumulatedContent = "";
+          const accumulatedToolCalls: OllamaToolCall[] = [];
+          let finalResponse: OllamaChatResponse | undefined;
+          const chatStream = await client.chat({
+            model: model.id,
+            messages: ollamaMessages,
+            stream: true,
+            tools: ollamaTools.length > 0 ? ollamaTools : undefined,
+            options: ollamaOptions,
+          });
+          for await (const chunk of chatStream) {
+            if (chunk.message?.content) {
+              accumulatedContent += chunk.message.content;
+            }
+            if (chunk.message?.tool_calls) {
+              accumulatedToolCalls.push(...chunk.message.tool_calls);
+            }
+            if (chunk.done) {
+              finalResponse = {
+                ...chunk,
+                created_at:
+                  chunk.created_at instanceof Date
+                    ? chunk.created_at.toISOString()
+                    : chunk.created_at,
+              } as OllamaChatResponse;
+              break;
+            }
           }
-
-          // Ollama sends tool_calls in intermediate (done:false) chunks,
-          // NOT in the final done:true chunk. Collect from all chunks.
-          if (chunk.message?.tool_calls) {
-            accumulatedToolCalls.push(...chunk.message.tool_calls);
+          if (!finalResponse) {
+            throw new Error("Ollama API stream ended without a final response");
           }
-
-          if (chunk.done) {
-            finalResponse = chunk;
-            break;
+          finalResponse.message.content = accumulatedContent;
+          if (accumulatedToolCalls.length > 0) {
+            finalResponse.message.tool_calls = accumulatedToolCalls;
           }
+          const assistantMessage = buildAssistantMessage(finalResponse, {
+            api: model.api,
+            provider: model.provider,
+            id: model.id,
+          });
+          const reason: Extract<StopReason, "stop" | "length" | "toolUse"> =
+            assistantMessage.stopReason === "toolUse" ? "toolUse" : "stop";
+          stream.push({ type: "done", reason, message: assistantMessage });
+        } else {
+          // Use HTTP/NDJSON for local
+          const body: OllamaChatRequest = {
+            model: model.id,
+            messages: ollamaMessages,
+            stream: true,
+            ...(ollamaTools.length > 0 ? { tools: ollamaTools } : {}),
+            options: ollamaOptions,
+          };
+          const headers: Record<string, string> = {
+            "Content-Type": "application/json",
+            ...options?.headers,
+          };
+          if (options?.apiKey) {
+            headers.Authorization = `Bearer ${options.apiKey}`;
+          }
+          const response = await fetch(chatUrl, {
+            method: "POST",
+            headers,
+            body: JSON.stringify(body),
+            signal: options?.signal,
+          });
+          if (!response.ok) {
+            const errorText = await response.text().catch(() => "unknown error");
+            throw new Error(`Ollama API error ${response.status}: ${errorText}`);
+          }
+          if (!response.body) {
+            throw new Error("Ollama API returned empty response body");
+          }
+          const reader = response.body.getReader();
+          let accumulatedContent = "";
+          const accumulatedToolCalls: OllamaToolCall[] = [];
+          let finalResponse: OllamaChatResponse | undefined;
+          for await (const chunk of parseNdjsonStream(reader)) {
+            if (chunk.message?.content) {
+              accumulatedContent += chunk.message.content;
+            }
+            if (chunk.message?.tool_calls) {
+              accumulatedToolCalls.push(...chunk.message.tool_calls);
+            }
+            if (chunk.done) {
+              finalResponse = chunk;
+              break;
+            }
+          }
+          if (!finalResponse) {
+            throw new Error("Ollama API stream ended without a final response");
+          }
+          finalResponse.message.content = accumulatedContent;
+          if (accumulatedToolCalls.length > 0) {
+            finalResponse.message.tool_calls = accumulatedToolCalls;
+          }
+          const assistantMessage = buildAssistantMessage(finalResponse, {
+            api: model.api,
+            provider: model.provider,
+            id: model.id,
+          });
+          const reason: Extract<StopReason, "stop" | "length" | "toolUse"> =
+            assistantMessage.stopReason === "toolUse" ? "toolUse" : "stop";
+          stream.push({ type: "done", reason, message: assistantMessage });
         }
-
-        if (!finalResponse) {
-          throw new Error("Ollama API stream ended without a final response");
-        }
-
-        finalResponse.message.content = accumulatedContent;
-        if (accumulatedToolCalls.length > 0) {
-          finalResponse.message.tool_calls = accumulatedToolCalls;
-        }
-
-        const assistantMessage = buildAssistantMessage(finalResponse, {
-          api: model.api,
-          provider: model.provider,
-          id: model.id,
-        });
-
-        const reason: Extract<StopReason, "stop" | "length" | "toolUse"> =
-          assistantMessage.stopReason === "toolUse" ? "toolUse" : "stop";
-
-        stream.push({
-          type: "done",
-          reason,
-          message: assistantMessage,
-        });
       } catch (err) {
         const errorMessage = err instanceof Error ? err.message : String(err);
         stream.push({
@@ -412,7 +400,6 @@ export function createOllamaStreamFn(baseUrl: string): StreamFn {
         stream.end();
       }
     };
-
     queueMicrotask(() => void run());
     return stream;
   };
